@@ -65,6 +65,18 @@ def get_us_stock_data(symbol, api_key, start_date, end_date):
         return None
 
 
+@st.cache_data(ttl=3600)
+def get_company_profile(symbol, api_key):
+    """美股公司基本資料（FMP /stable/ 端點）"""
+    url = f"https://financialmodelingprep.com/stable/profile?symbol={symbol}&apikey={api_key}"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        return data[0] if data and len(data) > 0 else None
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────
 # 台股輔助函數
 # ─────────────────────────────────────────────
@@ -3743,6 +3755,29 @@ if analyze_button:
 
                     rsi_col    = f'RSI{rsi_period}'
                     latest_rsi = data_with_indicators[rsi_col].iloc[-1] if rsi_col in data_with_indicators.columns else 50
+
+                    # ── 顯示 0：股票代碼 / 公司名稱 ──
+                    _disp_symbol = symbol.strip() if is_tw else symbol.upper()
+                    _company_name = ""
+                    if is_tw:
+                        try:
+                            _tw_profile_head = get_tw_company_profile(_disp_symbol)
+                            _company_name = _tw_profile_head.get("companyName", "") if _tw_profile_head else ""
+                            if _company_name == _disp_symbol:
+                                _company_name = ""
+                        except Exception:
+                            _company_name = ""
+                    else:
+                        try:
+                            _us_profile_head = get_company_profile(_disp_symbol, fmp_api_key)
+                            _company_name = _us_profile_head.get("companyName", "") if _us_profile_head else ""
+                        except Exception:
+                            _company_name = ""
+                    _name_col1, _name_col2 = st.columns(2)
+                    with _name_col1:
+                        st.metric("股票代碼", _disp_symbol)
+                    with _name_col2:
+                        st.metric("公司名稱", _company_name if _company_name else "—")
 
                     # ── 顯示 5：基本統計4欄 ──
                     st.markdown("### 📈 基本統計資訊")
