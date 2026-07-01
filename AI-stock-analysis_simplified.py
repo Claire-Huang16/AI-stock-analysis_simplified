@@ -33,7 +33,7 @@ st.set_page_config(
 )
 
 # 主標題
-st.title("📈 AI 股票趨勢分析系統")
+st.title("📈 AI 精簡股票趨勢分析系統")
 st.divider()
 
 
