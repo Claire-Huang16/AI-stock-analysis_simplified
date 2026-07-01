@@ -65,20 +65,8 @@ def get_us_stock_data(symbol, api_key, start_date, end_date):
         return None
 
 
-@st.cache_data(ttl=3600)
-def get_company_profile(symbol, api_key):
-    """美股公司基本資料（FMP /stable/ 端點）"""
-    url = f"https://financialmodelingprep.com/stable/profile?symbol={symbol}&apikey={api_key}"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        return data[0] if data and len(data) > 0 else None
-    except Exception:
-        return None
-
-
 # ─────────────────────────────────────────────
-# 台股輔助函數
+# 美股內部人深度查詢（T03 整合）
 # ─────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
@@ -101,20 +89,53 @@ def get_tw_company_profile(stock_code):
     return profile
 
 
-@st.cache_data(ttl=3600)
-def get_tw_company_name_finmind(stock_code, api_key):
-    """台股公司名稱（FinMind TaiwanStockInfo，不依賴 twstock 套件）"""
-    try:
-        url = "https://api.finmindtrade.com/api/v4/data"
-        params = {'dataset': 'TaiwanStockInfo', 'data_id': stock_code, 'token': api_key}
-        resp = requests.get(url, params=params, timeout=10)
-        result = resp.json()
-        data = result.get('data', [])
-        if data:
-            return data[0].get('stock_name', '')
-    except Exception:
-        pass
-    return ""
+@st.cache_data(ttl=86400)
+def get_tw_stock_display_name(stock_code: str, finmind_token: str = "") -> dict:
+    """
+    台股代號 → 公司名稱（雙層備援）
+    ① FinMind TaiwanStockInfo（線上，最準確）
+    ② twstock 本地資料庫（備援）
+    回傳 dict：name / source / industry / market
+    """
+    code = stock_code.strip()
+    result = {"name": "", "source": "unknown", "industry": "", "market": ""}
+
+    # ── ① FinMind TaiwanStockInfo ──
+    if finmind_token:
+        try:
+            resp = requests.get(
+                "https://api.finmindtrade.com/api/v4/data",
+                params={"dataset": "TaiwanStockInfo", "data_id": code, "token": finmind_token},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                if j.get("status") == 200 and j.get("data"):
+                    row = j["data"][0]
+                    name = row.get("stock_name", "").strip()
+                    if name and name != code:
+                        result.update({"name": name, "source": "finmind",
+                                       "industry": row.get("industry_category", ""),
+                                       "market": row.get("type", "")})
+                        return result
+        except Exception:
+            pass
+
+    # ── ② twstock 本地備援 ──
+    if _USE_TWSTOCK:
+        try:
+            info = _TW_CODES.get(code)
+            if info:
+                name = getattr(info, "name", "").strip()
+                if name and name != code:
+                    result.update({"name": name, "source": "twstock",
+                                   "industry": getattr(info, "group", ""),
+                                   "market": getattr(info, "market", "")})
+                    return result
+        except Exception:
+            pass
+
+    return result
 
 
 @st.cache_data(ttl=1800)
@@ -2113,6 +2134,350 @@ def _detect_rising_falling_three_method(k_list):
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 朱家泓 12個操作口訣圖形練功系統
+# 來源：朱家泓《圖形口訣》第 11-3 章（21頁圖形範例）
+#
+# 口訣1：多頭大量不漲，股價要回檔（當日或後數日）
+# 口訣2：空頭大量不跌，股價要反彈（當日或後數日）
+# 口訣3：利多不漲＝空頭；利空不跌＝多頭
+# 口訣4：空頭利空不跌，主力進場築底
+# 口訣5：多頭該回不回，過高要大漲
+# 口訣6：空頭該彈不彈，破低要大跌
+# 口訣7：多頭完成反轉，要大跌
+# 口訣8：空頭完成反轉，會大漲
+# 口訣9：晨星多方主控，夜星空方主控；晨星對夜星，強多對強空
+# 口訣10：一星二陽長紅跌破，近日易大跌；一星二陰長黑突破，近日易大漲
+# 口訣11：大量不漲關前爆量（壓力前大量不漲＝多力衰竭）
+# 口訣12：上漲高檔久盤必跌，下跌低檔久盤必漲
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_zhu_mnemonics(df):
+    """
+    依朱家泓 12 個操作口訣進行量化辨識，回傳觸發的口訣列表與整體研判。
+
+    回傳 dict：
+      triggered       : list[dict]  已觸發的口訣（含編號/名稱/說明/方向/強度）
+      bull_signals    : list[str]   多頭口訣簡述
+      bear_signals    : list[str]   空頭口訣簡述
+      net_score       : int         正值偏多，負值偏空（每個口訣 +1 多 / -1 空）
+      summary         : str         整體研判文字
+      detail          : dict        各項原始計算值供 GPT 參考
+    """
+    result = {
+        'triggered': [],
+        'bull_signals': [],
+        'bear_signals': [],
+        'net_score': 0,
+        'summary': '',
+        'detail': {},
+    }
+
+    if df is None or len(df) < 10:
+        result['summary'] = '資料不足，無法進行口訣辨識'
+        return result
+
+    n = len(df)
+    closes  = df['close'].values.astype(float)
+    opens   = df['open'].values.astype(float)
+    highs   = df['high'].values.astype(float)
+    lows    = df['low'].values.astype(float)
+    volumes = df['volume'].values.astype(float) if 'volume' in df.columns else None
+
+    c0, o0, h0, l0 = closes[-1], opens[-1], highs[-1], lows[-1]
+    c1, o1, h1 = closes[-2], opens[-2], highs[-2]
+    c2, o2 = (closes[-3], opens[-3]) if n >= 3 else (c1, o1)
+
+    # 均線
+    def sma(arr, p): return float(arr[-p:].mean()) if len(arr) >= p else None
+    ma5  = sma(closes, 5)
+    ma10 = sma(closes, 10)
+    ma20 = sma(closes, 20)
+    ma60 = sma(closes, 60) if n >= 60 else None
+
+    # 近期高低點（20日）
+    look = min(20, n - 1)
+    rh = float(highs[-look-1:-1].max()) if look > 0 else h0
+    rl = float(lows[-look-1:-1].min())  if look > 0 else l0
+    rel_pos = (c0 - rl) / (rh - rl + 1e-9)
+
+    # 位置判斷
+    is_high = rel_pos >= 0.75
+    is_low  = rel_pos <= 0.25
+    in_uptrend   = (ma5 and ma20 and ma5 > ma20) if (ma5 and ma20) else False
+    in_downtrend = (ma5 and ma20 and ma5 < ma20) if (ma5 and ma20) else False
+
+    # 量相關
+    avg_vol = float(volumes[-20:].mean()) if volumes is not None and len(volumes) >= 5 else None
+    v0  = float(volumes[-1]) if volumes is not None else None
+    v1  = float(volumes[-2]) if volumes is not None and len(volumes) >= 2 else None
+    big_vol    = (v0 is not None and avg_vol and v0 > avg_vol * 1.5)
+    huge_vol   = (v0 is not None and avg_vol and v0 > avg_vol * 2.5)  # 爆量
+
+    # K線紅黑
+    is_red0   = c0 > o0   # 今日紅K（台股：紅=上漲）
+    is_black0 = c0 < o0
+    is_red1   = c1 > o1
+    is_black1 = c1 < o1
+    is_red2   = c2 > o2
+    is_black2 = c2 < o2
+
+    body0 = abs(c0 - o0)
+    rng0  = max(h0 - l0, 1e-9)
+    long_body0 = body0 / rng0 >= 0.5
+
+    body1 = abs(c1 - o1)
+    rng1  = max(h1 - l1 if False else highs[-2] - lows[-2], 1e-9)
+    long_body1 = body1 / rng1 >= 0.5
+
+    def add(num, name, direction, strength, desc):
+        entry = {'num': num, 'name': name, 'direction': direction,
+                 'strength': strength, 'desc': desc}
+        result['triggered'].append(entry)
+        if direction == 'bull':
+            result['bull_signals'].append(f"【口訣{num}】{desc}")
+            result['net_score'] += strength
+        else:
+            result['bear_signals'].append(f"【口訣{num}】{desc}")
+            result['net_score'] -= strength
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣1：多頭大量不漲（高檔爆量黑K 或 量大收黑收平） → 回檔訊號
+    # ──────────────────────────────────────────────────────────────────
+    if in_uptrend and is_high and big_vol and (is_black0 or (not is_red0 and body0 / rng0 < 0.2)):
+        add(1, '多頭大量不漲', 'bear', 2,
+            f'多頭高檔爆量但收{"黑K" if is_black0 else "十字/紡錘"}，量大不漲 → 回檔風險高（量比≈{v0/avg_vol:.1f}x）')
+    elif in_uptrend and is_high and huge_vol and is_black0:
+        add(1, '多頭大量不漲', 'bear', 3,
+            f'多頭高檔爆天量黑K，強力回頭訊號，近期回檔機率高（量比≈{v0/avg_vol:.1f}x）')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣2：空頭大量不跌（低檔爆量紅K 或 量大收紅收平） → 反彈訊號
+    # ──────────────────────────────────────────────────────────────────
+    if in_downtrend and is_low and big_vol and (is_red0 or (not is_black0 and body0 / rng0 < 0.2)):
+        add(2, '空頭大量不跌', 'bull', 2,
+            f'空頭低檔爆量但收{"紅K" if is_red0 else "十字/紡錘"}，量大不跌 → 反彈訊號（量比≈{v0/avg_vol:.1f}x）')
+    elif in_downtrend and is_low and huge_vol and is_red0:
+        add(2, '空頭大量不跌', 'bull', 3,
+            f'空頭低檔爆天量長紅K，止跌反彈強力訊號（量比≈{v0/avg_vol:.1f}x）')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣5：多頭該回不回，過高要大漲
+    # 條件：上漲趨勢 + 均線多頭排列 + 近期回檔幅度小（< 3%）+ 收盤站上前高
+    # ──────────────────────────────────────────────────────────────────
+    if in_uptrend and ma5 and ma20 and ma5 > ma20:
+        pullback_5d = (max(closes[-5:]) - min(closes[-5:])) / (max(closes[-5:]) + 1e-9)
+        prev_high   = float(highs[-6:-1].max()) if n >= 6 else rh
+        if pullback_5d < 0.05 and c0 > prev_high:
+            add(5, '多頭該回不回過高大漲', 'bull', 2,
+                f'多頭走勢近5日回檔幅度僅{pullback_5d*100:.1f}%，今日收盤{c0:.2f}突破前高{prev_high:.2f}，口訣5：過高要大漲')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣6：空頭該彈不彈，破低要大跌
+    # ──────────────────────────────────────────────────────────────────
+    if in_downtrend and ma5 and ma20 and ma5 < ma20:
+        bounce_5d = (max(closes[-5:]) - min(closes[-5:])) / (min(closes[-5:]) + 1e-9)
+        prev_low  = float(lows[-6:-1].min()) if n >= 6 else rl
+        if bounce_5d < 0.05 and c0 < prev_low:
+            add(6, '空頭該彈不彈破低大跌', 'bear', 2,
+                f'空頭走勢近5日反彈幅度僅{bounce_5d*100:.1f}%，今日收盤{c0:.2f}跌破前低{prev_low:.2f}，口訣6：破低要大跌')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣7：多頭完成反轉，要大跌
+    # 訊號：高檔出現多頭確認後空頭確認（均線由多排翻空排 + 跌破重要均線）
+    # ──────────────────────────────────────────────────────────────────
+    if ma5 and ma10 and ma20:
+        was_bull = is_high  # 高檔位置代表曾是多頭
+        now_bear = ma5 < ma10 < ma20  # 均線翻空排
+        broke_ma20 = c0 < ma20
+        if was_bull and now_bear and broke_ma20:
+            add(7, '多頭完成反轉要大跌', 'bear', 3,
+                f'高檔均線由多頭排列轉空頭（MA5{ma5:.2f}<MA10{ma10:.2f}<MA20{ma20:.2f}），收盤{c0:.2f}跌破MA20，口訣7：要大跌')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣8：空頭完成反轉，會大漲
+    # ──────────────────────────────────────────────────────────────────
+    if ma5 and ma10 and ma20:
+        was_bear = is_low   # 低檔位置代表曾是空頭
+        now_bull = ma5 > ma10 > ma20
+        above_ma20 = c0 > ma20
+        if was_bear and now_bull and above_ma20:
+            add(8, '空頭完成反轉會大漲', 'bull', 3,
+                f'低檔均線由空頭排列轉多頭（MA5{ma5:.2f}>MA10{ma10:.2f}>MA20{ma20:.2f}），收盤{c0:.2f}突破MA20，口訣8：會大漲')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣9：晨星多方主控 / 夜星空方主控
+    # 晨星對夜星（強多對強空），看誰出現在更接近現在
+    # ──────────────────────────────────────────────────────────────────
+    if n >= 3:
+        # 夜星：長紅 + 跳空小實體（變盤）+ 長黑收過前紅中點以下
+        h2 = float(highs[-3]) if n >= 3 else h0
+        l2 = float(lows[-3])  if n >= 3 else l0
+        k1_rng = max(h2 - l2, 1e-9)
+        k1r = c2 > o2 and (abs(c2 - o2) / k1_rng) >= 0.4
+        k2_small = (body1/(max(highs[-2],lows[-2])-min(highs[-2],lows[-2])+1e-9)) <= 0.35
+        midK1 = (max(c2,o2) + min(c2,o2)) / 2
+        evening_star = k1r and k2_small and is_black0 and c0 < midK1 and is_high
+        # 晨星：長黑 + 小實體 + 長紅收過前黑中點以上
+        k1_bear = c2 < o2 and (abs(c2-o2)/(max(highs[-3],lows[-3])-min(highs[-3],lows[-3])+1e-9))>=0.4
+        morning_star = k1_bear and k2_small and is_red0 and c0 > midK1 and is_low
+        if evening_star:
+            add(9, '夜星空方主控', 'bear', 3,
+                f'高檔出現「夜星」K線組合（長紅→小實體→長黑收破中點），口訣9：夜星空方主控，強力轉折向下')
+        if morning_star:
+            add(9, '晨星多方主控', 'bull', 3,
+                f'低檔出現「晨星」K線組合（長黑→小實體→長紅收過中點），口訣9：晨星多方主控，強力轉折向上')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣10：一星二陽長紅跌破＝大跌 / 一星二陰長黑突破＝大漲
+    # 一星＝十字/小實體，二陽/二陰＝前兩根同向K線
+    # ──────────────────────────────────────────────────────────────────
+    if n >= 4:
+        k3r = closes[-4] > opens[-4]  # 第4根（舊）
+        k2r_cur = is_red2             # 第3根
+        k1_doji = (abs(c1-o1)/(max(highs[-2],lows[-2])-min(highs[-2],lows[-2])+1e-9)) <= 0.25  # 一星
+        # 一星二陽 + 今日長黑跌破前高（夜星延伸版）
+        if k3r and k2r_cur and k1_doji and is_black0 and long_body0 and c0 < min(o1,c1) and is_high:
+            add(10, '一星二陽長紅跌破大跌', 'bear', 3,
+                f'高檔「一星二陽」後今日長黑跌破星K低點，口訣10：近日易大跌')
+        # 一星二陰 + 今日長紅突破前低（晨星延伸版）
+        k3b = closes[-4] < opens[-4]
+        k2b_cur = is_black2
+        if k3b and k2b_cur and k1_doji and is_red0 and long_body0 and c0 > max(o1,c1) and is_low:
+            add(10, '一星二陰長黑突破大漲', 'bull', 3,
+                f'低檔「一星二陰」後今日長紅突破星K高點，口訣10：近日易大漲')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣11：大量不漲關前爆量（接近壓力位置時量大卻不突破＝多力衰竭）
+    # ──────────────────────────────────────────────────────────────────
+    if avg_vol and v0:
+        dist_to_high = (rh - c0) / c0 * 100
+        near_resistance = 0 <= dist_to_high <= 5   # 接近近期高點壓力（5%以內）
+        # 關前爆量不漲：接近壓力位 + 爆量 + 今日收黑或量大但未突破
+        if near_resistance and big_vol and (is_black0 or c0 < h0 * 0.98):
+            add(11, '關前爆量大量不漲', 'bear', 2,
+                f'接近壓力位({rh:.2f}，距{dist_to_high:.1f}%)，量比{v0/avg_vol:.1f}x爆量卻{"收黑" if is_black0 else "未突破高點"}，口訣11：多方衰竭')
+        # 反向：接近支撐位爆量不跌（口訣11反面 = 口訣2的位置版）
+        dist_to_low = (c0 - rl) / c0 * 100
+        near_support = 0 <= dist_to_low <= 5
+        if near_support and big_vol and (is_red0 or c0 > l0 * 1.02):
+            add(11, '關前爆量大量不跌', 'bull', 2,
+                f'接近支撐位({rl:.2f}，距{dist_to_low:.1f}%)，量比{v0/avg_vol:.1f}x爆量卻{"收紅" if is_red0 else "未跌破低點"}，口訣11反面：空方衰竭')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣12：上漲高檔久盤必跌，下跌低檔久盤必漲
+    # 久盤：近10日BBW極度壓縮（窄幅整理）且位置偏高或偏低
+    # ──────────────────────────────────────────────────────────────────
+    if n >= 15 and 'BB_Width' in df.columns:
+        recent_bbw = float(df['BB_Width'].iloc[-1])
+        bbw_5d_avg = float(df['BB_Width'].tail(5).mean())
+        if bbw_5d_avg < 0.08:   # 極度壓縮閾值
+            if is_high and big_vol and is_black0:
+                add(12, '高檔久盤跌破必跌', 'bear', 3,
+                    f'高檔BBW={bbw_5d_avg:.3f}（極度壓縮），今日爆量收黑，口訣12：高檔久盤跌破必跌')
+            elif is_low and big_vol and is_red0:
+                add(12, '低檔久盤突破必漲', 'bull', 3,
+                    f'低檔BBW={bbw_5d_avg:.3f}（極度壓縮），今日爆量收紅，口訣12：低檔久盤突破必漲')
+            elif is_high:
+                add(12, '高檔久盤留意跌破', 'bear', 1,
+                    f'高檔BBW={bbw_5d_avg:.3f}（極度壓縮），盤整中，口訣12：上漲高檔久盤必跌，留意跌破時機')
+            elif is_low:
+                add(12, '低檔久盤留意突破', 'bull', 1,
+                    f'低檔BBW={bbw_5d_avg:.3f}（極度壓縮），盤整中，口訣12：下跌低檔久盤必漲，留意突破時機')
+
+    # ── 補充：口訣3/4（利多不漲 / 利空不跌）無法從純技術面量化，留給 GPT 解讀 ──
+    # 口訣3/4 需要結合新聞面/基本面，在 GPT prompt 中提示 AI 注意
+
+    # ── 彙整 summary ──
+    nb = len(result['bull_signals'])
+    ns = len(result['bear_signals'])
+    score = result['net_score']
+
+    if score >= 4:
+        result['summary'] = f'⚡ 口訣研判：強多頭訊號（{nb}個多頭口訣觸發，淨分{score:+d}）'
+    elif score >= 2:
+        result['summary'] = f'📈 口訣研判：偏多（{nb}個多頭口訣觸發，淨分{score:+d}）'
+    elif score <= -4:
+        result['summary'] = f'⚡ 口訣研判：強空頭訊號（{ns}個空頭口訣觸發，淨分{score:+d}）'
+    elif score <= -2:
+        result['summary'] = f'📉 口訣研判：偏空（{ns}個空頭口訣觸發，淨分{score:+d}）'
+    elif nb == 0 and ns == 0:
+        result['summary'] = '⚪ 口訣研判：目前無明顯口訣訊號，繼續觀察'
+    else:
+        result['summary'] = f'⚖️ 口訣研判：多空交錯（多{nb}空{ns}，淨分{score:+d}），方向待確認'
+
+    result['detail'] = {
+        'rel_pos': round(rel_pos, 2), 'is_high': is_high, 'is_low': is_low,
+        'in_uptrend': in_uptrend, 'in_downtrend': in_downtrend,
+        'vol_ratio': round(v0 / avg_vol, 2) if (v0 and avg_vol) else None,
+        'big_vol': big_vol, 'huge_vol': huge_vol,
+    }
+    return result
+
+
+def display_zhu_mnemonics_dashboard(mnemonics_result, symbol):
+    """顯示朱家泓12口訣觸發結果儀表板"""
+    triggered = mnemonics_result.get('triggered', [])
+    summary   = mnemonics_result.get('summary', '')
+    bull_sigs = mnemonics_result.get('bull_signals', [])
+    bear_sigs = mnemonics_result.get('bear_signals', [])
+    score     = mnemonics_result.get('net_score', 0)
+
+    st.markdown("---")
+    st.markdown("### 📖 朱家泓 12個操作口訣辨識")
+    st.caption("來源：朱家泓《圖形口訣》第11-3章 — 量化辨識多空操作口訣觸發訊號")
+
+    if not triggered:
+        st.info(f"⚪ 目前無明顯口訣訊號觸發，繼續觀察趨勢發展。\n\n"
+                f"> 口訣3（利多不漲/利空不跌）及更多背景判斷，請參考 AI 投資建議的口訣分析段落。")
+        return
+
+    # 整體研判橫幅
+    banner_color = '#2ed573' if score > 0 else ('#ff4757' if score < 0 else '#f9ca24')
+    st.markdown(f"""
+<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
+  border:2px solid {banner_color};border-radius:12px;padding:14px 20px;margin-bottom:16px;">
+  <span style="font-size:17px;font-weight:700;color:{banner_color};">{summary}</span>
+</div>""", unsafe_allow_html=True)
+
+    # 已觸發的口訣卡片
+    col_bull, col_bear = st.columns(2)
+    with col_bull:
+        if bull_sigs:
+            st.markdown("**🟢 多頭口訣訊號**")
+            for s in bull_sigs:
+                st.success(s)
+        else:
+            st.caption("🟢 無多頭口訣訊號")
+    with col_bear:
+        if bear_sigs:
+            st.markdown("**🔴 空頭口訣訊號**")
+            for s in bear_sigs:
+                st.error(s)
+        else:
+            st.caption("🔴 無空頭口訣訊號")
+
+    with st.expander("📋 朱家泓12口訣快速參考", expanded=False):
+        st.markdown("""
+| # | 口訣 | 多空 |
+|---|------|------|
+| 1 | **多頭大量不漲**，股價要回檔（當日或後數日） | 🔴 空 |
+| 2 | **空頭大量不跌**，股價要反彈（當日或後數日） | 🟢 多 |
+| 3 | 利多不漲＝空頭；**利空不跌＝多頭** | 情境判斷 |
+| 4 | **空頭利空不跌**，主力進場築底 | 🟢 多 |
+| 5 | 多頭**該回不回**，過高要大漲 | 🟢 多 |
+| 6 | 空頭**該彈不彈**，破低要大跌 | 🔴 空 |
+| 7 | **多頭完成反轉**，要大跌 | 🔴 空 |
+| 8 | **空頭完成反轉**，會大漲 | 🟢 多 |
+| 9 | **晨星多方主控**，夜星空方主控；晨星對夜星，強多對強空 | 情境判斷 |
+| 10 | 一星二陽長紅跌破近日易大跌；**一星二陰長黑突破近日易大漲** | 情境判斷 |
+| 11 | **大量不漲**，關前爆量（壓力前爆量不漲＝多力衰竭） | 🔴 空 |
+| 12 | 上漲**高檔久盤必跌**；下跌**低檔久盤必漲** | 情境判斷 |
+
+> ⚠️ 口訣為趨勢觀察工具，需搭配整體走勢與成交量確認，不構成投資建議。
+        """)
+
+
 def calculate_kline_pattern_system(df):
     """
     朱家泓 K線型態分析系統 — 產生 0–100 分的K線結構評分。
@@ -2496,8 +2861,8 @@ def display_kline_pattern_dashboard(kline_result, symbol):
 # ─────────────────────────────────────────────
 
 def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
-
-                              institutional_df=None, market='us', selected_mas=None):
+                              institutional_df=None, market='us', selected_mas=None,
+                              sr_result=None):
     """
     v3 主K線多層圖：K線+BB+可切換MA / RSI / OBV / 成交量 / 三大法人（台股）
     美股5層，台股6層
@@ -2731,10 +3096,23 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
 
     # ── 佈局更新 ──
     fig.update_layout(
-        title=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
+        title=dict(
+            text=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
+            font=dict(size=14),
+            x=0, xanchor='left',
+            pad=dict(t=4, l=0),
+        ),
         height=chart_height,
         showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="v",       # 垂直排列，不與標題搶水平空間
+            yanchor="top", y=1,
+            xanchor="left", x=1.01,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ddd", borderwidth=1,
+            font=dict(size=10),
+        ),
+        margin=dict(t=60, r=160),  # 上方給標題空間，右方給圖例空間
         template='plotly_white'
     )
     fig.update_xaxes(rangeslider_visible=False)
@@ -2745,6 +3123,467 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
     if show_inst:
         fig.update_yaxes(title_text="買賣超（張）", row=5, col=1)
     fig.update_yaxes(title_text="KD", row=kd_row, col=1)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 朱家泓切線系統 — 支撐壓力自動計算與 Plotly 標注
+# 來源：朱家泓《切線》第5-6章（99頁）
+#   5-1 上升/下降切線（連接底底高/頭頭低）
+#   5-2 軌道線（趨勢通道）
+#   6-2 七大支撐壓力來源：
+#       ① 切線支撐/壓力  ② 水平轉折高低點
+#       ③ 盤整區         ④ 跳空缺口
+#       ⑤ 大量長紅/黑K   ⑥ 均線 MA20/60
+#       ⑦ 二分之一價
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_zhu_sr_levels(df: 'pd.DataFrame', pivot_window: int = 3) -> dict:
+    """
+    依朱家泓切線系統自動計算七大支撐壓力來源。
+    輸入 df 需含 open/high/low/close/volume 欄位（小寫）與 date 欄位。
+
+    回傳 dict：
+      trendlines   : list[dict]  切線（上升/下降）
+      channels     : list[dict]  軌道線（上下軌）
+      h_supports   : list[dict]  水平支撐（轉折低點）
+      h_resistances: list[dict]  水平壓力（轉折高點）
+      consolidations: list[dict] 盤整區（密集橫盤）
+      gaps         : list[dict]  跳空缺口
+      big_volume_k : list[dict]  大量長紅/黑K支撐壓力
+      half_price   : float       二分之一波段價
+      summary_text : str         摘要文字供 GPT 使用
+    """
+    import numpy as np
+
+    result = {
+        'trendlines': [], 'channels': [], 'h_supports': [], 'h_resistances': [],
+        'consolidations': [], 'gaps': [], 'big_volume_k': [],
+        'half_price': None, 'summary_text': '',
+    }
+
+    if df is None or len(df) < 15:
+        return result
+
+    closes  = df['close'].values.astype(float)
+    opens   = df['open'].values.astype(float)
+    highs   = df['high'].values.astype(float)
+    lows    = df['low'].values.astype(float)
+    volumes = df['volume'].values.astype(float) if 'volume' in df.columns else None
+    dates   = df['date'].values if 'date' in df.columns else list(range(len(df)))
+    n = len(df)
+
+    # ── ① 轉折高低點（pivot points）───────────────────────────────
+    w = pivot_window
+    pivot_highs, pivot_lows = [], []
+    for i in range(w, n - w):
+        h = highs[i]
+        if all(highs[j] <= h for j in range(i-w, i)) and all(highs[j] <= h for j in range(i+1, i+w+1)):
+            pivot_highs.append({'i': i, 'v': h, 'date': str(dates[i])[:10]})
+        l = lows[i]
+        if all(lows[j] >= l for j in range(i-w, i)) and all(lows[j] >= l for j in range(i+1, i+w+1)):
+            pivot_lows.append({'i': i, 'v': l, 'date': str(dates[i])[:10]})
+
+    # 取最近4個有效高低點作為水平支撐壓力
+    result['h_supports']   = pivot_lows[-4:]
+    result['h_resistances'] = pivot_highs[-4:]
+
+    # ── ② 切線 & 軌道線（上升/下降）──────────────────────────────
+    def fit_line(pts):
+        """線性回歸擬合趨勢線，回傳斜率、截距"""
+        if len(pts) < 2:
+            return None
+        xi = np.array([p['i'] for p in pts], dtype=float)
+        yi = np.array([p['v'] for p in pts], dtype=float)
+        if len(pts) == 2:
+            slope = (yi[1] - yi[0]) / (xi[1] - xi[0] + 1e-9)
+            intercept = yi[0] - slope * xi[0]
+        else:
+            mx, my = xi.mean(), yi.mean()
+            slope = ((xi - mx) * (yi - my)).sum() / ((xi - mx)**2).sum()
+            intercept = my - slope * mx
+        return {'slope': slope, 'intercept': intercept,
+                'pts': pts, 'i_start': int(xi[0]), 'i_end': int(xi[-1])}
+
+    # 上升切線：取最近2~3個有效低點中「底底高」的組合
+    valid_lows = [p for p in pivot_lows if p['i'] > n * 0.05]
+    if len(valid_lows) >= 2:
+        up_pts = valid_lows[-3:]  # 最近3個低點
+        up_tl = fit_line(up_pts)
+        if up_tl and up_tl['slope'] > 0:
+            # 計算延伸到最新
+            v_end = up_tl['slope'] * (n - 1) + up_tl['intercept']
+            result['trendlines'].append({
+                'type': 'up', 'label': '上升切線（支撐）',
+                'i_start': up_tl['i_start'], 'i_end': n - 1,
+                'v_start': up_tl['slope'] * up_tl['i_start'] + up_tl['intercept'],
+                'v_end': v_end, 'slope': up_tl['slope'],
+                'color': '#2ecc71', 'dash': 'solid', 'width': 2,
+                'current_value': round(float(v_end), 2),
+            })
+            # 軌道上軌：取切線段內各高點到切線最大偏離
+            channel_offsets = []
+            for i in range(up_tl['i_start'], min(up_tl['i_end'] + 1, n)):
+                tl_val = up_tl['slope'] * i + up_tl['intercept']
+                channel_offsets.append(highs[i] - tl_val)
+            if channel_offsets:
+                offset = max(channel_offsets) * 0.85
+                result['channels'].append({
+                    'type': 'up_upper', 'label': '上升軌道上軌（壓力）',
+                    'i_start': up_tl['i_start'], 'i_end': n - 1,
+                    'v_start': up_tl['slope'] * up_tl['i_start'] + up_tl['intercept'] + offset,
+                    'v_end': v_end + offset, 'color': '#2ecc71', 'dash': 'dot',
+                })
+
+    # 下降切線：取最近2~3個有效高點中「頭頭低」的組合
+    valid_highs = [p for p in pivot_highs if p['i'] > n * 0.05]
+    if len(valid_highs) >= 2:
+        dn_pts = valid_highs[-3:]
+        dn_tl = fit_line(dn_pts)
+        if dn_tl and dn_tl['slope'] < 0:
+            v_end = dn_tl['slope'] * (n - 1) + dn_tl['intercept']
+            result['trendlines'].append({
+                'type': 'dn', 'label': '下降切線（壓力）',
+                'i_start': dn_tl['i_start'], 'i_end': n - 1,
+                'v_start': dn_tl['slope'] * dn_tl['i_start'] + dn_tl['intercept'],
+                'v_end': v_end, 'slope': dn_tl['slope'],
+                'color': '#e74c3c', 'dash': 'solid', 'width': 2,
+                'current_value': round(float(v_end), 2),
+            })
+            channel_offsets = []
+            for i in range(dn_tl['i_start'], min(dn_tl['i_end'] + 1, n)):
+                tl_val = dn_tl['slope'] * i + dn_tl['intercept']
+                channel_offsets.append(tl_val - lows[i])
+            if channel_offsets:
+                offset = max(channel_offsets) * 0.85
+                result['channels'].append({
+                    'type': 'dn_lower', 'label': '下降軌道下軌（支撐）',
+                    'i_start': dn_tl['i_start'], 'i_end': n - 1,
+                    'v_start': dn_tl['slope'] * dn_tl['i_start'] + dn_tl['intercept'] - offset,
+                    'v_end': v_end - offset, 'color': '#e74c3c', 'dash': 'dot',
+                })
+
+    # ── ③ 盤整區（密集橫盤）─────────────────────────────────────
+    min_len, max_range = 5, 0.08
+    i = 0
+    while i < n - min_len:
+        lo = float(np.min(lows[i:i+min_len]))
+        hi = float(np.max(highs[i:i+min_len]))
+        if (hi - lo) / (lo + 1e-9) <= max_range:
+            j = i + min_len
+            while j < n and lows[j] >= lo * 0.99 and highs[j] <= hi * 1.01:
+                j += 1
+            if j - i >= min_len:
+                result['consolidations'].append({
+                    'i0': i, 'i1': j - 1,
+                    'lo': round(float(lo), 2), 'hi': round(float(hi), 2),
+                    'date_start': str(dates[i])[:10], 'date_end': str(dates[j-1])[:10],
+                    'label': f'盤整區 {lo:.2f}–{hi:.2f}',
+                })
+            i = j
+        else:
+            i += 1
+
+    # ── ④ 跳空缺口（min gap 0.5%）───────────────────────────────
+    min_gap_pct = 0.005
+    for i in range(1, n):
+        up_gap = lows[i] > highs[i-1] and (lows[i] - highs[i-1]) / (highs[i-1] + 1e-9) > min_gap_pct
+        dn_gap = highs[i] < lows[i-1] and (lows[i-1] - highs[i]) / (lows[i-1] + 1e-9) > min_gap_pct
+        if up_gap:
+            result['gaps'].append({
+                'i': i, 'type': 'up', 'lo': round(float(highs[i-1]), 2), 'hi': round(float(lows[i]), 2),
+                'date': str(dates[i])[:10], 'label': f'向上缺口支撐 {highs[i-1]:.2f}–{lows[i]:.2f}',
+            })
+        if dn_gap:
+            result['gaps'].append({
+                'i': i, 'type': 'dn', 'lo': round(float(highs[i]), 2), 'hi': round(float(lows[i-1]), 2),
+                'date': str(dates[i])[:10], 'label': f'向下缺口壓力 {highs[i]:.2f}–{lows[i-1]:.2f}',
+            })
+
+    # ── ⑤ 大量長紅/黑K支撐壓力 ─────────────────────────────────
+    if volumes is not None:
+        avg_vol = float(np.mean(volumes[-20:])) if n >= 20 else float(np.mean(volumes))
+        for i in range(n):
+            if volumes[i] > avg_vol * 1.8:
+                body = abs(closes[i] - opens[i])
+                body_pct = body / (highs[i] - lows[i] + 1e-9)
+                if body_pct >= 0.4:
+                    is_red = closes[i] > opens[i]
+                    result['big_volume_k'].append({
+                        'i': i, 'is_red': is_red, 'date': str(dates[i])[:10],
+                        'close': round(float(closes[i]), 2),
+                        'support_or_resist': 'support' if is_red else 'resist',
+                        'label': f'大量{"長紅K支撐" if is_red else "長黑K壓力"} @ {closes[i]:.2f}',
+                        'vol_ratio': round(float(volumes[i] / avg_vol), 1),
+                    })
+        # 只保留最近5個
+        result['big_volume_k'] = sorted(result['big_volume_k'], key=lambda x: x['i'])[-5:]
+
+    # ── ⑥ 二分之一價 ────────────────────────────────────────────
+    max_h, min_l = float(np.max(highs)), float(np.min(lows))
+    result['half_price'] = round((max_h + min_l) / 2, 2)
+
+    # ── 摘要文字供 GPT 參考 ─────────────────────────────────────
+    lines = ["【朱家泓切線系統 支撐壓力分析】"]
+
+    if result['trendlines']:
+        for tl in result['trendlines']:
+            lines.append(f"  {tl['label']}：延伸至今為 {tl['current_value']:.2f}")
+
+    sups = [str(p['v']) for p in result['h_supports'][-3:]]
+    ress = [str(p['v']) for p in result['h_resistances'][-3:]]
+    if sups:  lines.append(f"  水平支撐（轉折低點）：{' / '.join(sups)}")
+    if ress:  lines.append(f"  水平壓力（轉折高點）：{' / '.join(ress)}")
+
+    if result['consolidations']:
+        last_c = result['consolidations'][-1]
+        lines.append(f"  最近盤整區：{last_c['lo']}–{last_c['hi']}（{last_c['date_start']}起）")
+
+    if result['gaps']:
+        recent_g = result['gaps'][-2:]
+        for g in recent_g:
+            lines.append(f"  {g['label']}（{g['date']}）")
+
+    if result['big_volume_k']:
+        last_bk = result['big_volume_k'][-1]
+        lines.append(f"  {last_bk['label']}（量比{last_bk['vol_ratio']}x，{last_bk['date']}）")
+
+    lines.append(f"  二分之一波段價：{result['half_price']}")
+
+    result['summary_text'] = '\n'.join(lines)
+    return result
+
+
+def add_sr_traces_to_fig(fig, df, sr_result, row=1):
+    """
+    將 calculate_zhu_sr_levels 的結果以 Plotly trace 加入 K 線圖第 row 列。
+    包含：切線、軌道線、水平支撐/壓力線、盤整區色塊、缺口色塊、大量K棒標記、½ 價位線。
+    """
+    if df is None or sr_result is None:
+        return fig
+
+    n = len(df)
+    dates = df['date'].values if 'date' in df.columns else list(range(n))
+    is_subplot = (row is not None)  # None = standalone figure, no row/col kwargs
+
+    def idx_to_date(i):
+        i = max(0, min(i, n - 1))
+        return str(dates[i])[:10]
+
+    def add_shape(**kwargs):
+        if is_subplot:
+            fig.add_shape(row=row, col=1, **kwargs)
+        else:
+            fig.add_shape(**kwargs)
+
+    def add_annotation(**kwargs):
+        if is_subplot:
+            fig.add_annotation(row=row, col=1, **kwargs)
+        else:
+            fig.add_annotation(**kwargs)
+
+    def add_hline(**kwargs):
+        if is_subplot:
+            fig.add_hline(row=row, col=1, **kwargs)
+        else:
+            fig.add_hline(**kwargs)
+
+    def add_trace_sr(trace):
+        if is_subplot:
+            fig.add_trace(trace, row=row, col=1)
+        else:
+            fig.add_trace(trace)
+
+    # ── 切線 ──────────────────────────────────────────────────────
+    for tl in sr_result.get('trendlines', []):
+        x0, x1 = idx_to_date(tl['i_start']), idx_to_date(tl['i_end'])
+        add_shape(type='line', x0=x0, y0=tl['v_start'], x1=x1, y1=tl['v_end'],
+                  line=dict(color=tl['color'], width=tl.get('width', 2),
+                            dash=tl.get('dash', 'solid')))
+        add_annotation(x=x1, y=tl['v_end'], text=tl['label'],
+                       showarrow=False, font=dict(size=10, color=tl['color']),
+                       xanchor='right', bgcolor='rgba(255,255,255,0.75)',
+                       bordercolor=tl['color'], borderwidth=1)
+
+    # ── 軌道線 ────────────────────────────────────────────────────
+    for ch in sr_result.get('channels', []):
+        x0, x1 = idx_to_date(ch['i_start']), idx_to_date(ch['i_end'])
+        add_shape(type='line', x0=x0, y0=ch['v_start'], x1=x1, y1=ch['v_end'],
+                  line=dict(color=ch['color'], width=1, dash='dot'))
+
+    # ── 水平支撐（藍色虛線）─────────────────────────────────────
+    for sup in sr_result.get('h_supports', []):
+        add_hline(y=sup['v'],
+                  line=dict(color='#3498db', width=1.2, dash='dash'),
+                  annotation_text=f"撐 {sup['v']:.2f} ({sup['date'][:5]})",
+                  annotation_font_size=9, annotation_font_color='#1a6fa8',
+                  annotation_bgcolor='rgba(255,255,255,0.7)')
+
+    # ── 水平壓力（橘色虛線）─────────────────────────────────────
+    for res in sr_result.get('h_resistances', []):
+        add_hline(y=res['v'],
+                  line=dict(color='#e67e22', width=1.2, dash='dash'),
+                  annotation_text=f"壓 {res['v']:.2f} ({res['date'][:5]})",
+                  annotation_font_size=9, annotation_font_color='#a04000',
+                  annotation_bgcolor='rgba(255,255,255,0.7)')
+
+    # ── 盤整區（橘色半透明色塊，最近2個）────────────────────────
+    for con in sr_result.get('consolidations', [])[-2:]:
+        x0 = idx_to_date(con['i0'])
+        x1 = idx_to_date(con['i1'])
+        add_shape(type='rect',
+                  x0=x0, y0=con['lo'], x1=x1, y1=con['hi'],
+                  fillcolor='rgba(241,196,15,0.10)',
+                  line=dict(color='#e67e22', width=0.8, dash='dot'))
+        mid_i = (con['i0'] + con['i1']) // 2
+        add_annotation(x=idx_to_date(mid_i), y=con['hi'],
+                       text='盤整區', showarrow=False,
+                       font=dict(size=9, color='#a04000'),
+                       bgcolor='rgba(255,255,255,0.6)')
+
+    # ── 跳空缺口（半透明色塊，最近4個）─────────────────────────
+    for gap in sr_result.get('gaps', [])[-4:]:
+        fill_c = 'rgba(46,213,115,0.12)' if gap['type'] == 'up' else 'rgba(255,71,87,0.10)'
+        line_c = '#2ecc71' if gap['type'] == 'up' else '#e74c3c'
+        i_prev = max(0, gap['i'] - 1)
+        add_shape(type='rect',
+                  x0=idx_to_date(i_prev), y0=gap['lo'],
+                  x1=idx_to_date(gap['i']), y1=gap['hi'],
+                  fillcolor=fill_c,
+                  line=dict(color=line_c, width=0.6, dash='dot'))
+
+    # ── 大量K棒支撐/壓力標記（散點箭頭）────────────────────────
+    for bk in sr_result.get('big_volume_k', []):
+        g_date = bk['date']
+        marker_sym = 'triangle-up' if bk['is_red'] else 'triangle-down'
+        marker_col = '#27ae60' if bk['is_red'] else '#c0392b'
+        try:
+            row_data = df[df['date'].astype(str).str[:10] == g_date].iloc[0]
+            y_val = row_data['low'] * 0.99 if bk['is_red'] else row_data['high'] * 1.01
+        except Exception:
+            y_val = bk['close']
+        add_trace_sr(go.Scatter(
+            x=[g_date], y=[y_val],
+            mode='markers+text',
+            marker=dict(symbol=marker_sym, size=11, color=marker_col),
+            text=[f'量{bk["vol_ratio"]}x'],
+            textfont=dict(size=8, color=marker_col),
+            textposition='top center' if bk['is_red'] else 'bottom center',
+            name='大量K棒',
+            showlegend=False,
+            hovertext=bk['label'],
+        ))
+
+    # ── 二分之一價（紫色點線）────────────────────────────────────
+    half_p = sr_result.get('half_price')
+    if half_p:
+        add_hline(y=half_p,
+                  line=dict(color='#8e44ad', width=1.2, dash='dashdot'),
+                  annotation_text=f"½波段 {half_p}",
+                  annotation_font_size=9, annotation_font_color='#8e44ad',
+                  annotation_bgcolor='rgba(255,255,255,0.7)')
+
+    return fig
+
+
+def create_sr_chart(df, symbol, sr_result, currency_symbol='NT$'):
+    """
+    朱家泓切線系統 — 獨立支撐壓力K線圖。
+    乾淨的單層 K 線，疊加七大支撐壓力標注：
+      切線 / 軌道線 / 水平支撐壓力 / 盤整區 / 跳空缺口 / 大量K棒 / ½ 價位
+    不含 RSI/OBV/KD/成交量等指標，保持清晰。
+    """
+    if df is None or sr_result is None or len(df) < 5:
+        return None
+
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    # ── K 線（台股：紅=漲，綠=跌）──
+    fig.add_trace(go.Candlestick(
+        x=df['date'],
+        open=df['open'], high=df['high'],
+        low=df['low'],  close=df['close'],
+        increasing=dict(line=dict(color='#e74c3c', width=1.2),
+                        fillcolor='#e74c3c'),
+        decreasing=dict(line=dict(color='#27ae60', width=1.2),
+                        fillcolor='#27ae60'),
+        name='K線',
+        showlegend=False,
+    ))
+
+    # ── MA20 / MA60（細線，背景參考）──
+    closes = df['close'].values.astype(float)
+    n = len(closes)
+    ma20 = [float(closes[max(0,i-19):i+1].mean()) if i >= 19 else None for i in range(n)]
+    ma60 = [float(closes[max(0,i-59):i+1].mean()) if i >= 59 else None for i in range(n)]
+    for ma_vals, col, nm in [(ma20, '#9b59b6', 'MA20'), (ma60, '#e67e22', 'MA60')]:
+        valid = [(df['date'].iloc[i], v) for i, v in enumerate(ma_vals) if v is not None]
+        if valid:
+            xs, ys = zip(*valid)
+            fig.add_trace(go.Scatter(
+                x=list(xs), y=list(ys), mode='lines', name=nm,
+                line=dict(color=col, width=1.2, dash='dot'),
+                opacity=0.6, showlegend=True,
+            ))
+
+    # ── 疊加七大支撐壓力 ──
+    fig = add_sr_traces_to_fig(fig, df, sr_result, row=None)
+
+    # ── 圖表說明 annotation（右上角）──
+    legend_items = [
+        ('━', '#27ae60', '上升切線（支撐）'),
+        ('━', '#e74c3c', '下降切線（壓力）'),
+        ('╌', '#3498db', '水平支撐'),
+        ('╌', '#e67e22', '水平壓力'),
+        ('□', '#f39c12', '盤整區'),
+        ('▤', '#27ae60', '向上缺口支撐'),
+        ('▤', '#e74c3c', '向下缺口壓力'),
+        ('╌', '#8e44ad', '½ 波段價'),
+    ]
+
+    fig.update_layout(
+        title=dict(
+            text=f'📐 {symbol} — 朱家泓切線系統 支撐壓力分析圖',
+            font=dict(size=16),
+        ),
+        height=620,
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                    xanchor='right', x=1, font=dict(size=11)),
+        template='plotly_white',
+        xaxis_rangeslider_visible=False,
+        yaxis_title=f'價格（{currency_symbol}）',
+        plot_bgcolor='#fafafa',
+        margin=dict(l=60, r=160, t=80, b=40),
+        annotations=[
+            # 標注框說明（右側）
+            dict(
+                text=(
+                    '<b>圖例說明</b><br>'
+                    '━ <span style="color:#27ae60">上升切線（支撐）</span><br>'
+                    '━ <span style="color:#e74c3c">下降切線（壓力）</span><br>'
+                    '╌ <span style="color:#3498db">水平支撐（轉折低）</span><br>'
+                    '╌ <span style="color:#e67e22">水平壓力（轉折高）</span><br>'
+                    '□ <span style="color:#c0932a">盤整區（套牢/進貨）</span><br>'
+                    '▤ <span style="color:#27ae60">向上跳空缺口（支撐）</span><br>'
+                    '▤ <span style="color:#e74c3c">向下跳空缺口（壓力）</span><br>'
+                    '╌ <span style="color:#8e44ad">½ 波段中間價</span><br>'
+                    '▲▼ 大量K棒位置'
+                ),
+                xref='paper', yref='paper',
+                x=1.01, y=0.98,
+                xanchor='left', yanchor='top',
+                showarrow=False,
+                font=dict(size=10, family='Noto Sans TC, sans-serif'),
+                bgcolor='rgba(255,255,255,0.88)',
+                bordercolor='#ddd', borderwidth=1,
+                align='left',
+            ),
+        ],
+    )
 
     return fig
 
@@ -3088,7 +3927,8 @@ def create_analyst_chart(analyst_data, symbol, currency_symbol, current_price):
 
 
 def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
-                               zhu_result=None, bull_signals=None, kline_result=None, rsi_period=14,
+                               zhu_result=None, bull_signals=None, kline_result=None,
+                               mnemonics_result=None, sr_result=None, rsi_period=14,
                                institutional_df=None, margin_df=None,
                                weekly_df=None, financial_data=None,
                                analyst_data=None, insider_df=None, director_df=None):
@@ -3270,6 +4110,15 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
         if zhu_str:  lines_list += ["", zhu_str]
         if bull_str: lines_list.append(bull_str)
         if kline_str: lines_list.append(kline_str)
+        if mnemonics_result and mnemonics_result.get('triggered'):
+            m_summary = mnemonics_result.get('summary', '')
+            m_bull = '、'.join([f"口訣{t['num']}" for t in mnemonics_result['triggered'] if t['direction']=='bull'])
+            m_bear = '、'.join([f"口訣{t['num']}" for t in mnemonics_result['triggered'] if t['direction']=='bear'])
+            lines_list.append(f"\n【朱家泓12口訣辨識】{m_summary}")
+            if m_bull: lines_list.append(f"  多頭口訣：{m_bull} — " + "；".join(mnemonics_result['bull_signals']))
+            if m_bear: lines_list.append(f"  空頭口訣：{m_bear} — " + "；".join(mnemonics_result['bear_signals']))
+        if sr_result and sr_result.get('summary_text'):
+            lines_list.append(f"\n{sr_result['summary_text']}")
 
         data_block = "\n".join(lines_list)
 
@@ -3370,7 +4219,8 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
 
 
 def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', zhu_result=None,
-                                bull_signals=None, kline_result=None, rsi_period=14,
+                                bull_signals=None, kline_result=None, mnemonics_result=None,
+                                sr_result=None, rsi_period=14,
                                 institutional_df=None, margin_df=None,
                                 financial_data=None, analyst_data=None,
                                 insider_df=None, director_df=None):
@@ -3478,6 +4328,20 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
             if kline_result.get('patterns_found'):
                 summary_lines.append(f"K線命中型態：{'、'.join(kline_result['patterns_found'])}")
 
+        # 朱家泓12口訣辨識摘要
+        if mnemonics_result and mnemonics_result.get('triggered'):
+            summary_lines.append(f"\n【朱家泓12口訣圖形辨識】{mnemonics_result.get('summary','')}")
+            for t in mnemonics_result['triggered']:
+                dir_tag = '🟢多頭' if t['direction']=='bull' else '🔴空頭'
+                summary_lines.append(f"  {dir_tag} 口訣{t['num']}《{t['name']}》：{t['desc']}")
+            summary_lines.append(
+                "  ※ 口訣3（利多不漲/利空不跌）及口訣4（空頭利空不跌）需結合基本面/消息面由AI研判"
+            )
+
+        # 朱家泓切線系統支撐壓力
+        if sr_result and sr_result.get('summary_text'):
+            summary_lines.append(f"\n{sr_result['summary_text']}")
+
         # 台股籌碼附加
         if market == 'tw':
             if institutional_df is not None and len(institutional_df) > 0:
@@ -3518,11 +4382,14 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
         data_summary = "\n".join(summary_lines)
 
         system_msg = """你是一位資深股票分析師，擅長整合技術面、籌碼面與基本面，給出具體、結構化的投資建議。
+你熟悉朱家泓《多空操作秘笈》的12個操作口訣（圖形口訣），會在建議中引用觸發的口訣名稱加強論據。
 
 重要規則：
 - 使用繁體中文
 - 只輸出格式化的投資建議，不要重複前面已有的技術分析
 - 建議必須包含具體的觀察依據（例如：RSI數值、均線位置、法人動向）
+- 如果數據中有朱家泓口訣觸發記錄，需在「主要依據」段落引用相關口訣（例如：「觸發口訣1：多頭大量不漲，股價回檔機率高」）
+- 口訣3（利多不漲/利空不跌）與口訣4（空頭利空不跌）需結合消息面/基本面由你主動研判是否適用
 - 嚴禁「保證獲利」等不當用語；須加上「以上為技術面分析參考，非投資建議，投資有風險」免責聲明
 - 輸出格式嚴格按照下方範本
 """
@@ -3550,7 +4417,7 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 - 停損：（具體數值或條件）
 - 停利：（具體數值或條件）
 
-**主要依據**：（2–3句說明，引用RSI/MACD/布林通道/成交量等具體數值）
+**主要依據**：（2–3句說明，引用RSI/MACD/布林通道/成交量等具體數值；若有口訣觸發請引用口訣名稱）
 
 ---
 
@@ -3569,6 +4436,12 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 - （指標3）
 
 **主要依據**：（3–4句說明，整合技術面、籌碼面、基本面）
+
+---
+
+### 📖 朱家泓口訣研判
+
+（根據觸發的口訣，說明目前圖形形態的操作意義；若無口訣觸發請說明目前圖形尚不符合任何口訣條件，建議繼續觀察。請特別評估口訣3/4是否適用於當前消息面環境。）
 
 ---
 
@@ -3604,7 +4477,6 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 # AI 分析函數
 # ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
 # 側邊欄 UI
 # ─────────────────────────────────────────────
 
@@ -3674,7 +4546,6 @@ st.sidebar.markdown("""
 請使用者自行判斷投資決策，並承擔相關風險。本系統作者不對任何投資行為負責，亦不承擔任何損失責任。
 """)
 
-
 # ─────────────────────────────────────────────
 # 主要分析邏輯
 # ─────────────────────────────────────────────
@@ -3721,9 +4592,18 @@ if analyze_button:
                     data_with_indicators = calculate_advanced_indicators(data_with_indicators)
 
                 # ── Step 5: 計算多頭訊號 ──
-                bull_signals = calculate_bull_signals(data_with_indicators)
-                zhu_result   = calculate_zhu_trend_system(data_with_indicators)
-                kline_result = calculate_kline_pattern_system(data_with_indicators)
+                bull_signals     = calculate_bull_signals(data_with_indicators)
+                zhu_result       = calculate_zhu_trend_system(data_with_indicators)
+                kline_result     = calculate_kline_pattern_system(data_with_indicators)
+                mnemonics_result = calculate_zhu_mnemonics(data_with_indicators)
+
+                # ── Step 5b: 朱家泓切線系統 支撐壓力自動計算 ──
+                with st.spinner("計算切線系統支撐壓力（朱家泓第5–6章）..."):
+                    try:
+                        sr_result = calculate_zhu_sr_levels(data_with_indicators)
+                    except Exception as _sr_err:
+                        sr_result = None
+                        st.caption(f"切線支撐壓力計算跳過：{_sr_err}")
 
                 # ── Step 6: 籌碼/附加數據 ──
                 margin_df        = None
@@ -3772,32 +4652,66 @@ if analyze_button:
                     rsi_col    = f'RSI{rsi_period}'
                     latest_rsi = data_with_indicators[rsi_col].iloc[-1] if rsi_col in data_with_indicators.columns else 50
 
-                    # ── 顯示 0：股票代碼 / 公司名稱 ──
-                    _disp_symbol = symbol.strip() if is_tw else symbol.upper()
-                    _company_name = ""
+                    # ── 顯示 0：股票代號 + 公司名稱 橫幅 ──
+                    _sym_display = symbol.strip() if is_tw else symbol.upper()
+
                     if is_tw:
-                        try:
-                            _company_name = get_tw_company_name_finmind(_disp_symbol, finmind_api_key)
-                        except Exception:
-                            _company_name = ""
-                        if not _company_name:
-                            try:
-                                _tw_profile_head = get_tw_company_profile(_disp_symbol)
-                                _cn = _tw_profile_head.get("companyName", "") if _tw_profile_head else ""
-                                _company_name = _cn if _cn != _disp_symbol else ""
-                            except Exception:
-                                pass
+                        _name_info = get_tw_stock_display_name(
+                            symbol.strip(),
+                            finmind_token=finmind_api_key or ""
+                        )
+                        _company_name = _name_info.get("name", "")
+                        _industry     = _name_info.get("industry", "")
+                        _market_type  = _name_info.get("market", "")
+                        _src_label    = ("FinMind" if _name_info["source"] == "finmind"
+                                         else ("twstock" if _name_info["source"] == "twstock" else ""))
                     else:
+                        _company_name = ""
+                        _industry     = ""
+                        _market_type  = "US"
+                        _src_label    = ""
                         try:
-                            _us_profile_head = get_company_profile(_disp_symbol, fmp_api_key)
-                            _company_name = _us_profile_head.get("companyName", "") if _us_profile_head else ""
+                            import yfinance as _yf
+                            _yinfo = _yf.Ticker(_sym_display).info
+                            _company_name = _yinfo.get("longName") or _yinfo.get("shortName") or ""
+                            _industry     = _yinfo.get("sector") or _yinfo.get("industry") or ""
                         except Exception:
-                            _company_name = ""
-                    _name_col1, _name_col2 = st.columns(2)
-                    with _name_col1:
-                        st.metric("股票代碼", _disp_symbol)
-                    with _name_col2:
-                        st.metric("公司名稱", _company_name if _company_name else "—")
+                            pass
+
+                    _tag_map = {"twse": "上市", "tpex": "上櫃", "otc": "上櫃",
+                                "emerging": "興櫃", "US": "美股"}
+                    _meta_tags = []
+                    if _market_type:
+                        _meta_tags.append(_tag_map.get(_market_type.lower(), _market_type))
+                    if _industry:
+                        _meta_tags.append(_industry)
+                    if _src_label:
+                        _meta_tags.append(f"資料來源：{_src_label}")
+
+                    _tags_html = "".join(
+                        f'<span style="background:rgba(167,139,250,0.12);color:#a29bfe;'
+                        f'border:0.5px solid rgba(167,139,250,0.3);border-radius:12px;'
+                        f'padding:3px 10px;font-size:12px;margin-right:6px;">{t}</span>'
+                        for t in _meta_tags
+                    )
+                    _name_part = (
+                        f'<span style="font-size:22px;font-weight:400;color:#adb5bd;'
+                        f'margin-left:14px;">{_company_name}</span>'
+                        if _company_name else ""
+                    )
+                    st.markdown(
+                        f'''<div style="
+                          padding:14px 20px;margin-bottom:10px;
+                          background:linear-gradient(135deg,rgba(26,26,46,0.9) 0%,rgba(22,33,62,0.9) 100%);
+                          border:1px solid rgba(167,139,250,0.25);border-radius:12px;">
+                          <div>
+                            <span style="font-size:28px;font-weight:700;color:#fff;letter-spacing:0.5px;">{_sym_display}</span>
+                            {_name_part}
+                          </div>
+                          <div style="margin-top:7px;">{_tags_html}</div>
+                        </div>''',
+                        unsafe_allow_html=True,
+                    )
 
                     # ── 顯示 5：基本統計4欄 ──
                     st.markdown("### 📈 基本統計資訊")
@@ -3996,6 +4910,22 @@ if analyze_button:
                         st.success(f"📉 RSI 超賣提示：目前 RSI = **{latest_rsi:.2f}**，已進入超賣區域（<30）。歷史數據顯示此區域曾出現反彈現象，但不代表未來走勢。")
                     else:
                         st.info(f"📊 RSI 中性：目前 RSI = **{latest_rsi:.2f}**，位於中性區域（30–70）。")
+
+                    # ── 顯示 3b：朱家泓切線系統 支撐壓力圖（獨立乾淨圖）──
+                    if sr_result is not None:
+                        sr_chart = create_sr_chart(
+                            data_with_indicators,
+                            symbol.upper() if not is_tw else symbol.strip(),
+                            sr_result,
+                            currency_symbol=currency_symbol,
+                        )
+                        if sr_chart:
+                            st.markdown("### 📐 切線系統 — 支撐壓力分析圖")
+                            st.caption(
+                                "依朱家泓《切線》第5–6章 七大支撐壓力來源："
+                                "切線 / 軌道線 / 水平支撐壓力 / 盤整區 / 跳空缺口 / 大量K棒 / ½ 波段價"
+                            )
+                            st.plotly_chart(sr_chart, use_container_width=True)
 
                     # ── 顯示 9（台股）：籌碼面分析（T09規格第9項）──
                     if is_tw:
@@ -4242,6 +5172,12 @@ if analyze_button:
                         symbol.strip() if is_tw else symbol.upper()
                     )
 
+                    # ── 顯示 11c：朱家泓12口訣辨識 ──
+                    display_zhu_mnemonics_dashboard(
+                        mnemonics_result,
+                        symbol.strip() if is_tw else symbol.upper()
+                    )
+
                     # ── 顯示 16：選股評量表格（分析完成後自動 AI 填入）──
                     st.markdown("---")
                     st.markdown("### 📋 選股評量表格")
@@ -4261,6 +5197,8 @@ if analyze_button:
                             zhu_result=zhu_result,
                             bull_signals=bull_signals,
                             kline_result=kline_result,
+                            mnemonics_result=mnemonics_result,
+                            sr_result=sr_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
@@ -4414,6 +5352,8 @@ if analyze_button:
                             bull_signals=bull_signals,
                             zhu_result=zhu_result,
                             kline_result=kline_result,
+                            mnemonics_result=mnemonics_result,
+                            sr_result=sr_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
@@ -4421,7 +5361,6 @@ if analyze_button:
                         )
                     if investment_advice:
                         st.markdown(investment_advice)
-
 
                     st.success("✅ 分析完成！")
             else:
@@ -4440,13 +5379,16 @@ if not analyze_button:
 
 ### 🚀 功能特色
 - **雙市場支援**: 美股（FMP API）與台股（FinMind API），下拉選單一鍵切換
+- **股票名稱與公司名稱**: 代碼自動查詢公司全名、產業別、市場別（上市／上櫃／興櫃）
 - **📈 基本統計資訊**: 起始/結束價格、漲跌幅、最新 RSI 一覽
 - **🎯 法人目標價分析**: AI 新聞彙整 + 第三方數據源（鉅亨網／GoodInfo／Finviz／FMP）多來源整合
 - **🚦 多頭訊號儀表板**: 8項指標燈號（🟢🟡🔴）+ 整體評分（0–100分）
 - **📊 主K線圖**: 布林通道 + 可切換MA線 + OBV + 成交量
+- **📐 切線系統 — 支撐壓力分析圖**: 朱家泓《切線》第5–6章七大支撐壓力來源自動標注
 - **🧩 籌碼面分析（台股）**: 三大法人30日 + 主力分點進出 + 散戶籌碼比（融資融券）+ 走勢總圖
 - **📐 趨勢線系統分析**: 朱家泓《趨勢線》教材規則，多頭確認/趨勢轉換/進出場判斷
 - **🕯️ K線型態分析系統**: 朱家泓《多空操作秘笈》K線型態辨識
+- **📖 朱家泓 12個操作口訣辨識**: 依《圖形口訣》第11-3章自動比對盤面訊號
 - **📋 選股評量表格**: 依據圖表10-3-1，AI 自動填入，可手動微調後下載 CSV
 - **💡 長短線投資建議**: 整合技術/籌碼/法人面，獨立輸出短線（1–4週）與長線（1–6月）操作建議、進出場條件、停損停利與風險提示
 
@@ -4462,6 +5404,9 @@ if not analyze_button:
 MACD轉正 / BB突破中軌 / BB壓縮突破 / OBV資金流入 / RSI動量 / DMI多頭趨勢 / DMI黃金交叉 / 均線多頭排列
 - **🟢 綠燈（12.5分）** | **🟡 黃燈（6分）** | **🔴 紅燈（0分）**
 - 評分 ≥70：多頭確認 | 40–69：訊號混合 | <40：條件不符
+
+### 📐 切線系統 — 七大支撐壓力來源
+① 切線支撐/壓力　② 水平轉折高低點　③ 盤整區　④ 跳空缺口　⑤ 大量長紅/黑K　⑥ 均線 MA20/60　⑦ 二分之一價
 
 ### 🗂️ 台股籌碼面分析
 - **三大法人**: 外資/投信/自營商每日買賣超，中文欄位+30日彙總
