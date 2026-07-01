@@ -101,6 +101,22 @@ def get_tw_company_profile(stock_code):
     return profile
 
 
+@st.cache_data(ttl=3600)
+def get_tw_company_name_finmind(stock_code, api_key):
+    """台股公司名稱（FinMind TaiwanStockInfo，不依賴 twstock 套件）"""
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {'dataset': 'TaiwanStockInfo', 'data_id': stock_code, 'token': api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        result = resp.json()
+        data = result.get('data', [])
+        if data:
+            return data[0].get('stock_name', '')
+    except Exception:
+        pass
+    return ""
+
+
 @st.cache_data(ttl=1800)
 def _goodinfo_get(url, params=None, timeout=20):
     """GET goodinfo，回傳 (html, error)，帶 1 秒延遲避免限速"""
@@ -3761,12 +3777,16 @@ if analyze_button:
                     _company_name = ""
                     if is_tw:
                         try:
-                            _tw_profile_head = get_tw_company_profile(_disp_symbol)
-                            _company_name = _tw_profile_head.get("companyName", "") if _tw_profile_head else ""
-                            if _company_name == _disp_symbol:
-                                _company_name = ""
+                            _company_name = get_tw_company_name_finmind(_disp_symbol, finmind_api_key)
                         except Exception:
                             _company_name = ""
+                        if not _company_name:
+                            try:
+                                _tw_profile_head = get_tw_company_profile(_disp_symbol)
+                                _cn = _tw_profile_head.get("companyName", "") if _tw_profile_head else ""
+                                _company_name = _cn if _cn != _disp_symbol else ""
+                            except Exception:
+                                pass
                     else:
                         try:
                             _us_profile_head = get_company_profile(_disp_symbol, fmp_api_key)
