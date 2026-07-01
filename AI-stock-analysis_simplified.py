@@ -26,7 +26,7 @@ except ImportError:
 
 # 設置頁面配置
 st.set_page_config(
-    page_title="AI 股票趨勢分析系統",
+    page_title="AI 精簡股票趨勢分析系統",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
